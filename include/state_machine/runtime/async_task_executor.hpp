@@ -47,6 +47,8 @@ template <typename ExecutionContext> class AsyncTaskExecutor {
   public:
     explicit AsyncTaskExecutor(ExecutionContext& context) : context_(context) {}
 
+    // The executor and context must outlive every callback. Destruction from
+    // this executor's own worker is not supported; worker-side stop() is safe.
     ~AsyncTaskExecutor() {
         in_destructor_.store(true);
         stop();
@@ -58,30 +60,48 @@ template <typename ExecutionContext> class AsyncTaskExecutor {
     AsyncTaskExecutor& operator=(AsyncTaskExecutor&&) = delete;
 
     void start() {
-        bool expected = false;
-        if (!running_.compare_exchange_strong(expected, true)) {
+        // A worker cannot join/restart itself, or wait on a lifecycle lock
+        // held by a caller that is joining it. Restart from an external thread.
+        if (in_destructor_.load() || isWorkerThread()) {
             return;
         }
-        worker_thread_ = std::thread(&AsyncTaskExecutor::workerLoop, this);
-    }
-
-    void stop() {
-        std::lock_guard<std::mutex> stop_lock(stop_mutex_);
-        if (!running_.exchange(false)) {
+        TaskQueue discarded;
+        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+        if (running_.load()) {
             return;
         }
-
-        {
-            std::lock_guard<std::mutex> queue_lock(queue_mutex_);
-            while (!queue_.empty()) {
-                queue_.pop();
-            }
-        }
-
-        queue_cv_.notify_all();
+        // A callback may have requested stop without joining the old worker.
         if (worker_thread_.joinable()) {
             worker_thread_.join();
         }
+        running_.store(true);
+        try {
+            worker_thread_ = std::thread(&AsyncTaskExecutor::workerLoop, this);
+        } catch (...) {
+            requestStop(discarded);
+            throw;
+        }
+        // discarded is destroyed after lifecycle_lock, including on failure.
+    }
+
+    void stop() {
+        TaskQueue discarded;
+        if (isWorkerThread()) {
+            // Never take lifecycle_mutex_ here: an external stop may hold it
+            // while waiting for this callback to finish.
+            requestStop(discarded);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+            requestStop(discarded);
+            // Join even if running_ was already cleared by a worker-side stop.
+            if (worker_thread_.joinable()) {
+                worker_thread_.join();
+            }
+        }
+        // User task/capture destructors may re-enter stop() or queueSize().
+        // Destroy discarded tasks only after releasing both executor locks.
     }
 
     void pushTask(std::unique_ptr<Task<ExecutionContext>> task) {
@@ -109,7 +129,27 @@ template <typename ExecutionContext> class AsyncTaskExecutor {
     bool isRunning() const { return running_.load(); }
 
   private:
+    using TaskQueue = std::queue<std::unique_ptr<Task<ExecutionContext>>>;
+
+    bool isWorkerThread() const {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        return worker_id_ == std::this_thread::get_id();
+    }
+
+    void requestStop(TaskQueue& discarded) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            running_.store(false);
+            queue_.swap(discarded);
+        }
+        queue_cv_.notify_all();
+    }
+
     void workerLoop() {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            worker_id_ = std::this_thread::get_id();
+        }
         while (true) {
             std::unique_ptr<Task<ExecutionContext>> task;
             {
@@ -118,6 +158,7 @@ template <typename ExecutionContext> class AsyncTaskExecutor {
                     return !queue_.empty() || !running_.load();
                 });
                 if (!running_.load() && queue_.empty()) {
+                    worker_id_ = std::thread::id{};
                     break;
                 }
                 task = std::move(queue_.front());
@@ -136,12 +177,13 @@ template <typename ExecutionContext> class AsyncTaskExecutor {
     }
 
     ExecutionContext& context_;
-    std::queue<std::unique_ptr<Task<ExecutionContext>>> queue_;
+    TaskQueue queue_;
     mutable std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::thread worker_thread_;
     std::atomic<bool> running_{false};
-    std::mutex stop_mutex_;
+    std::mutex lifecycle_mutex_;
+    std::thread::id worker_id_{}; // Protected by queue_mutex_.
     std::atomic<bool> in_destructor_{false};
     std::atomic<uint64_t> tasks_executed_{0};
     std::atomic<uint64_t> tasks_failed_{0};

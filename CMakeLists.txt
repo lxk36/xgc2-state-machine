@@ -89,5 +89,17 @@ if(XGC2_STATE_MACHINE_BUILD_TESTING)
         pthread
     )
     add_test(NAME state_machine_runtime_test COMMAND state_machine_runtime_test)
+
+    find_package(Threads REQUIRED)
+    add_executable(async_task_executor_test test/async_task_executor_test.cpp)
+    target_link_libraries(async_task_executor_test
+      PRIVATE xgc2_state_machine::state_machine Threads::Threads
+    )
+    foreach(_case self_stop external_worker_stop discard_cleanup destructor_cleanup
+                  restart fifo_exceptions concurrent_lifecycle)
+      add_test(NAME async_task_executor_${_case}
+        COMMAND async_task_executor_test ${_case})
+      set_tests_properties(async_task_executor_${_case} PROPERTIES TIMEOUT 15)
+    endforeach()
   endif()
 endif()
